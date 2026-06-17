@@ -3,17 +3,16 @@ import logging
 import datetime
 import asyncio
 import time
+import re
 import pandas as pd
 from openai import OpenAI
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
 
-# PROTEÇÃO: Chaves lidas direto das variáveis de ambiente da Railway
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
-# Correção crucial de caminho para a Railway salvar e ler o Excel no mesmo lugar
 PASTA_ATUAL = os.path.dirname(os.path.abspath(__file__))
 NOME_PLANILHA = os.path.join(PASTA_ATUAL, "gatos_abrigo.xlsx")
 
@@ -24,19 +23,10 @@ client = OpenAI(
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-historicos = {}      
-usuarios_ativos = set() 
-
-INSTRUCOES_AGENTE = """
-Você é o assistente de um abrigo de animais. Sua única função é entrevistar o cuidador humano para cadastrar um gato.
-REGRAS OBRIGATÓRIAS:
-1. Sempre trate o usuário como um cuidador humano.
-2. Nunca pergunte "Qual é o seu peso?". Sempre pergunte "Qual é o peso do gato?".
-3. Se o usuário disser um nome, responda exatamente: "Perfeito, anotado. Agora, qual é o peso atual do gato (em kg)?" e aguarde a resposta dele.
-4. Seja direto, profissional e foque apenas nos dados do animal (Nome, Peso, Porte/Altura).
-5. NUNCA use asteriscos (*) ou símbolos semelhantes para destacar texto. Escreva em texto limpo.
-6. Após coletar o Nome, Peso e Porte, calcule a ração diária (regra: 15g a 20g de ração por quilo do gato ao dia) e encerre informando que o felino foi registrado.
-"""
+# Dicionários para controlar o estado da conversa sem depender da IA
+estados = {}
+dados_gatos = {}
+usuarios_ativos = set()
 
 def salvar_no_excel(nome, peso, racao):
     novos_dados = {
@@ -56,7 +46,9 @@ def salvar_no_excel(nome, peso, racao):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     usuarios_ativos.add(chat_id)
-    historicos[chat_id] = [{"role": "system", "content": INSTRUCOES_AGENTE}]
+    estados[chat_id] = "NOME"
+    dados_gatos[chat_id] = {}
+    
     saudacao = "🐾 <b>Sistema de Cadastro do Abrigo</b> 🐾\n\nVamos registrar um novo gatinho no sistema. Para começar, me diga: Qual é o nome dele(a)?"
     await update.message.reply_text(saudacao, parse_mode="HTML")
 
@@ -74,7 +66,6 @@ async def baixar_planilha(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Nenhuma planilha foi gerada ainda. Cadastre o primeiro gatinho para criá-la!")
 
 async def remover_gato(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
     if not context.args:
         await update.message.reply_text("⚠️ <b>Uso incorreto!</b> Digite o comando seguido do nome do gato.\nExemplo: <code>/remover Jack</code>", parse_mode="HTML")
         return
@@ -85,8 +76,6 @@ async def remover_gato(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not gato_existe.empty:
             df_atualizado = df[df['Nome do Gato'].astype(str).str.lower() != nome_alvo.lower()]
             df_atualizado.to_excel(NOME_PLANILHA, index=False)
-            if chat_id in historicos:
-                historicos[chat_id] = [{"role": "system", "content": INSTRUCOES_AGENTE}]
             await update.message.reply_text(f"✅ <b>Sucesso!</b> O gato <b>{nome_alvo}</b> foi removido do sistema.", parse_mode="HTML")
         else:
             await update.message.reply_text(f"❌ O gato <b>{nome_alvo}</b> não foi encontrado.", parse_mode="HTML")
@@ -95,49 +84,63 @@ async def remover_gato(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def responder_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    texto_usuario = update.message.text
+    texto_usuario = update.message.text.strip()
     
-    if chat_id not in historicos:
-        historicos[chat_id] = [{"role": "system", "content": INSTRUCOES_AGENTE}]
-    usuarios_ativos.add(chat_id)
-    
+    if chat_id not in estados:
+        estados[chat_id] = "NOME"
+        dados_gatos[chat_id] = {}
+
+    estado_atual = estados[chat_id]
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-    historicos[chat_id].append({"role": "user", "content": texto_usuario})
-    
-    prompt_ajuda = "[Instrução interna: Continue o fluxo de perguntas do gato. Se já calculou o resultado final da ração, adicione estritamente no final do texto: 'DATA_UPDATE: NomeDoGato, PesoDoGato, GramasDeRacao'. Não use asteriscos.]"
-    historicos[chat_id][-1]["content"] += f"\n{prompt_ajuda}"
-    
+
+    # Chamada para a IA (Poolside) para limpar e formatar a resposta do usuário
     try:
         loop = asyncio.get_event_loop()
         resposta = await loop.run_in_executor(
             None, 
             lambda: client.chat.completions.create(
                 model="poolside/laguna-m.1:free",
-                messages=historicos[chat_id]
+                messages=[
+                    {"role": "system", "content": "Você é um extrator de dados. Extraia apenas o dado puro do texto do usuário. Remova pontuações, palavras extras e responda APENAS com o valor bruto."},
+                    {"role": "user", "content": f"Extraia o dado puro deste texto baseado no contexto de cadastro: '{texto_usuario}'"}
+                ]
             )
         )
-        texto_resposta = resposta.choices[0].message.content.replace("*", "")
+        dado_limpo = resposta.choices[0].message.content.strip().replace("*", "")
     except Exception as e:
-        print(f"Erro na IA: {e}")
-        await update.message.reply_text("⚠️ Ocorreu uma instabilidade na comunicação com a IA. Por favor, tente repetir o envio.")
-        return
+        dado_limpo = texto_usuario  # se a IA falhar, usa o texto puro do usuário
 
-    historicos[chat_id][-1]["content"] = texto_usuario
-    
-    if "DATA_UPDATE:" in texto_resposta:
-        partes = texto_resposta.split("DATA_UPDATE:")
-        texto_exibir = partes[0].strip()
-        try:
-            dados = partes[1].strip().split(",")
-            salvar_no_excel(dados[0].strip(), dados[1].strip(), dados[2].strip())
-            texto_exibir += "\n\n<b>✅ [Sistema]: Gato registrado com sucesso na planilha Excel do abrigo!</b>"
-        except Exception as e:
-            print(f"Erro Excel: {e}")
-    else:
-        texto_exibir = texto_resposta
+    if estado_atual == "NOME":
+        dados_gatos[chat_id]["nome"] = dado_limpo
+        estados[chat_id] = "PESO"
+        await update.message.reply_text("Perfeito, anotado. Agora, qual é o peso atual do gato (em kg)?")
         
-    historicos[chat_id].append({"role": "assistant", "content": texto_exibir})
-    await update.message.reply_text(texto_exibir, parse_mode="HTML")
+    elif estado_atual == "PESO":
+        dados_gatos[chat_id]["peso"] = dado_limpo
+        estados[chat_id] = "PORTE"
+        await update.message.reply_text("Qual é o porte ou altura do gato? (Exemplo: pequeno, médio, grande ou em centímetros)")
+        
+    elif estado_atual == "PORTE":
+        # Pegar apenas os números do peso para calcular a ração de forma segura via Python
+        try:
+            peso_numerico = float(re.findall(r"[-+]?\d*\.\d+|\d+", dados_gatos[chat_id]["peso"])[0])
+            racao_calculada = int(peso_numerico * 15)  # 15g por quilo
+        except:
+            racao_calculada = 60  # Valor padrão caso digitem texto irreconhecível no peso
+
+        nome_final = dados_gatos[chat_id]["nome"]
+        peso_final = dados_gatos[chat_id]["peso"]
+        
+        # Salva fisicamente no Excel usando Python puro
+        salvar_no_excel(nome_final, peso_final, racao_calculada)
+        
+        # Resposta de finalização limpa
+        resposta_final = f"O felino {nome_final} foi registrado com sucesso.\n\n<b>✅ [Sistema]: Gato registrado com sucesso na planilha Excel do abrigo!</b>"
+        await update.message.reply_text(resposta_final, parse_mode="HTML")
+        
+        # Reseta o estado para o próximo cadastro
+        del estados[chat_id]
+        del dados_gatos[chat_id]
 
 async def envio_diario_meio_dia(context: ContextTypes.DEFAULT_TYPE):
     for chat_id in list(usuarios_ativos):
@@ -166,12 +169,12 @@ def main():
             application.add_handler(CommandHandler("remover", remover_gato))
             application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, responder_mensagem))
             
-            print("🚀 Bot ativo e rodando no servidor!")
+            print("🚀 Bot ativo com máquina de estados!")
             application.run_polling(drop_pending_updates=True)
         except Exception as erro_rede:
-            print(f"Desconexão de rede detectada: {erro_rede}. Reiniciando bot em 10 segundos...")
+            print(f"Erro: {erro_rede}. Reiniciando em 10 segundos...")
             time.sleep(10)
 
 if __name__ == "__main__":
     main()
-            
+    
