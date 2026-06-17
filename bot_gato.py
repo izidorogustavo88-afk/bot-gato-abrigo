@@ -68,7 +68,7 @@ def tentar_salvar_backup_preventivo(historico_conversa):
     texto_ia = " ".join([m["content"] for m in historico_conversa if m["role"] == "assistant"])
     
     # Procura padrões de peso (ex: 4kg, 4.5 kg, 5 quilos)
-    pesos_encontrados = re.findall(r"(\d+[\.,]?\d*)\s*(?:kg|quilo|kilo|kg)", texto_completo.lower())
+    pesos_encontrados = re.findall(r"(\d+[\.,]?\d*)\s*(?:kh|kg|quilo|kilo|kg)", texto_completo.lower())
     peso = pesos_encontrados[-1] if pesos_encontrados else "4"
     
     # Tenta estimar a ração baseado no peso encontrado
@@ -91,7 +91,10 @@ def tentar_salvar_backup_preventivo(historico_conversa):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     usuarios_ativos.add(chat_id)
+    
+    # CORREÇÃO 1: Força a limpeza total da memória antiga ao digitar /start
     historicos[chat_id] = [{"role": "system", "content": INSTRUCOES_AGENTE}]
+    
     saudacao = "🐾 <b>Sistema de Cadastro do Abrigo (Agente de IA)</b> 🐾\n\nOlá! Sou o assistente de Inteligência Artificial do abrigo. Vamos registrar um novo gatinho.\n\nPara começar, me diga: Qual é o nome dele(a)?"
     await update.message.reply_text(saudacao, parse_mode="HTML")
 
@@ -120,8 +123,10 @@ async def remover_gato(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not gato_existe.empty:
             df_atualizado = df[df['Nome do Gato'].astype(str).str.lower() != nome_alvo.lower()]
             df_atualizado.to_excel(NOME_PLANILHA, index=False)
-            if chat_id in historicos:
-                historicos[chat_id] = [{"role": "system", "content": INSTRUCOES_AGENTE}]
+            
+            # Limpa a memória se o usuário estiver no meio de um cadastro errôneo
+            historicos[chat_id] = [{"role": "system", "content": INSTRUCOES_AGENTE}]
+            
             await update.message.reply_text(f"✅ <b>Sucesso!</b> O gato <b>{nome_alvo}</b> foi removido do sistema.", parse_mode="HTML")
         else:
             await update.message.reply_text(f"❌ O gato <b>{nome_alvo}</b> não foi encontrado.", parse_mode="HTML")
@@ -163,7 +168,9 @@ async def responder_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE)
             dados = partes[1].strip().split(",")
             salvar_no_excel(dados[0].strip(), dados[1].strip(), dados[2].strip())
             texto_exibir += "\n\n<b>✅ [Sistema]: Gato registrado com sucesso na planilha Excel pelo Agente de IA!</b>"
-            historicos[chat_id] = [{"role": "system", "content": INSTRUCOES_AGENTE}] # Reseta para o próximo gatinho
+            
+            # CORREÇÃO 2: Limpa totalmente a memória assim que o cadastro é concluído com sucesso
+            historicos[chat_id] = [{"role": "system", "content": INSTRUCOES_AGENTE}]
         except Exception as e:
             print(f"Erro ao processar dados da IA: {e}")
     else:
@@ -172,9 +179,14 @@ async def responder_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if "registrado" in texto_resposta.lower() or "sucesso" in texto_resposta.lower():
             if tentar_salvar_backup_preventivo(historicos[chat_id]):
                 texto_exibir += "\n\n<b>✅ [Sistema]: Dados salvos via redundância na planilha!</b>"
+                
+                # CORREÇÃO 3: Limpa totalmente a memória na redundância também
                 historicos[chat_id] = [{"role": "system", "content": INSTRUCOES_AGENTE}]
 
-    historicos[chat_id].append({"role": "assistant", "content": texto_exibir})
+    # Só adiciona ao histórico se a memória não tiver sido resetada acima
+    if chat_id in historicos and len(historicos[chat_id]) > 1:
+        historicos[chat_id].append({"role": "assistant", "content": texto_exibir})
+        
     await update.message.reply_text(texto_exibir, parse_mode="HTML")
 
 async def envio_diario_meio_dia(context: ContextTypes.DEFAULT_TYPE):
@@ -204,7 +216,7 @@ def main():
             application.add_handler(CommandHandler("remover", remover_gato))
             application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, responder_mensagem))
             
-            print("🚀 Agente de IA ativo e rodando!")
+            print("🚀 Agente de IA ativo com memória corrigida!")
             application.run_polling(drop_pending_updates=True)
         except Exception as erro_rede:
             print(f"Erro de rede: {erro_rede}. Reiniciando em 10 segundos...")
