@@ -108,7 +108,7 @@ async def responder_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE)
         resposta = await loop.run_in_executor(
             None, 
             lambda: client.chat.completions.create(
-                model="google/gemma-2-9b-it:free",
+                model="meta-llama/llama-3-8b-instruct:free",
                 messages=historicos[chat_id]
             )
         )
