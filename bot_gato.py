@@ -4,15 +4,17 @@ import datetime
 import asyncio
 import time
 import re
-import pandas as pd
 from openai import OpenAI
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
+import pandas as pd
 
+# PROTEÇÃO: Chaves lidas direto da Railway
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
+# Garantindo o caminho correto para salvar e baixar na Railway
 PASTA_ATUAL = os.path.dirname(os.path.abspath(__file__))
 NOME_PLANILHA = os.path.join(PASTA_ATUAL, "gatos_abrigo.xlsx")
 
@@ -23,10 +25,24 @@ client = OpenAI(
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# Dicionários para controlar o estado da conversa sem depender da IA
-estados = {}
-dados_gatos = {}
-usuarios_ativos = set()
+historicos = {}      
+usuarios_ativos = set() 
+
+# PROMPT DO AGENTE DE IA (Otimizado para o Llama 3)
+INSTRUCOES_AGENTE = """
+Você é o assistente virtual de IA de um abrigo de animais. Sua única função é entrevistar o cuidador para cadastrar um gato.
+Você deve coletar três informações de forma natural e conversacional:
+1. O Nome do gato.
+2. O Peso atual do gato (em kg).
+3. O Porte ou Altura (ex: pequeno, médio, grande ou em cm).
+
+REGRAS OBRIGATÓRIAS:
+- Faça apenas uma pergunta por vez. Seja simpático, profissional e direto.
+- NUNCA use asteriscos (*) ou símbolos para destacar textos nas suas respostas.
+- Assim que o usuário fornecer o Porte/Altura (a última informação), você deve calcular a ração diária (regra: 15g de ração por quilo do gato).
+- Ao encerrar, informe ao usuário que o felino foi registrado com sucesso e adicione OBRIGATORIAMENTE no final do seu texto o marcador oculto exatamente neste formato:
+DATA_UPDATE: NomeDoGato, PesoDoGato, GramasDeRacao
+"""
 
 def salvar_no_excel(nome, peso, racao):
     novos_dados = {
@@ -43,13 +59,40 @@ def salvar_no_excel(nome, peso, racao):
         df_final = df_novo
     df_final.to_excel(NOME_PLANILHA, index=False)
 
+def tentar_salvar_backup_preventivo(historico_conversa):
+    """
+    Função extra de segurança: Se a IA esquecer o formato 'DATA_UPDATE:', 
+    esta função varre o texto atrás dos dados e tenta salvar de qualquer forma.
+    """
+    texto_completo = " ".join([m["content"] for m in historico_conversa if m["role"] == "user"])
+    texto_ia = " ".join([m["content"] for m in historico_conversa if m["role"] == "assistant"])
+    
+    # Procura padrões de peso (ex: 4kg, 4.5 kg, 5 quilos)
+    pesos_encontrados = re.findall(r"(\d+[\.,]?\d*)\s*(?:kg|quilo|kilo|kg)", texto_completo.lower())
+    peso = pesos_encontrados[-1] if pesos_encontrados else "4"
+    
+    # Tenta estimar a ração baseado no peso encontrado
+    try:
+        peso_num = float(peso.replace(",", "."))
+        racao = int(peso_num * 15)
+    except:
+        racao = 60
+
+    # Pega a primeira palavra longa enviada como possível nome
+    palavras = [p for p in texto_completo.split() if len(p) > 2 and "/" not in p and "kg" not in p.lower()]
+    nome = palavras[0] if palavras else "Gato_Abrigo"
+    
+    # Se o fluxo parece ter terminado na IA, salva preventivamente
+    if "registrado" in texto_ia.lower() or "sucesso" in texto_ia.lower() or "ração" in texto_ia.lower():
+        salvar_no_excel(nome, f"{peso} kg", racao)
+        return True
+    return False
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     usuarios_ativos.add(chat_id)
-    estados[chat_id] = "NOME"
-    dados_gatos[chat_id] = {}
-    
-    saudacao = "🐾 <b>Sistema de Cadastro do Abrigo</b> 🐾\n\nVamos registrar um novo gatinho no sistema. Para começar, me diga: Qual é o nome dele(a)?"
+    historicos[chat_id] = [{"role": "system", "content": INSTRUCOES_AGENTE}]
+    saudacao = "🐾 <b>Sistema de Cadastro do Abrigo (Agente de IA)</b> 🐾\n\nOlá! Sou o assistente de Inteligência Artificial do abrigo. Vamos registrar um novo gatinho.\n\nPara começar, me diga: Qual é o nome dele(a)?"
     await update.message.reply_text(saudacao, parse_mode="HTML")
 
 async def baixar_planilha(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -60,12 +103,13 @@ async def baixar_planilha(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=update.effective_chat.id,
                 document=arquivo,
                 filename="gatos_abrigo.xlsx",
-                caption="🐱 Aqui está a planilha atualizada com os gatinhos cadastrados!"
+                caption="🐱 Aqui está a planilha atualizada com os gatinhos cadastrados pelo Agente de IA!"
             )
     else:
-        await update.message.reply_text("❌ Nenhuma planilha foi gerada ainda. Cadastre o primeiro gatinho para criá-la!")
+        await update.message.reply_text("❌ Nenhuma planilha foi gerada ainda. Termine o cadastro de um gatinho com a IA para criá-la!")
 
 async def remover_gato(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
     if not context.args:
         await update.message.reply_text("⚠️ <b>Uso incorreto!</b> Digite o comando seguido do nome do gato.\nExemplo: <code>/remover Jack</code>", parse_mode="HTML")
         return
@@ -76,6 +120,8 @@ async def remover_gato(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not gato_existe.empty:
             df_atualizado = df[df['Nome do Gato'].astype(str).str.lower() != nome_alvo.lower()]
             df_atualizado.to_excel(NOME_PLANILHA, index=False)
+            if chat_id in historicos:
+                historicos[chat_id] = [{"role": "system", "content": INSTRUCOES_AGENTE}]
             await update.message.reply_text(f"✅ <b>Sucesso!</b> O gato <b>{nome_alvo}</b> foi removido do sistema.", parse_mode="HTML")
         else:
             await update.message.reply_text(f"❌ O gato <b>{nome_alvo}</b> não foi encontrado.", parse_mode="HTML")
@@ -84,63 +130,52 @@ async def remover_gato(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def responder_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    texto_usuario = update.message.text.strip()
+    texto_usuario = update.message.text
     
-    if chat_id not in estados:
-        estados[chat_id] = "NOME"
-        dados_gatos[chat_id] = {}
-
-    estado_atual = estados[chat_id]
+    if chat_id not in historicos:
+        historicos[chat_id] = [{"role": "system", "content": INSTRUCOES_AGENTE}]
+    usuarios_ativos.add(chat_id)
+    
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-
-    # Chamada para a IA (Poolside) para limpar e formatar a resposta do usuário
+    historicos[chat_id].append({"role": "user", "content": texto_usuario})
+    
     try:
         loop = asyncio.get_event_loop()
         resposta = await loop.run_in_executor(
             None, 
             lambda: client.chat.completions.create(
-                model="poolside/laguna-m.1:free",
-                messages=[
-                    {"role": "system", "content": "Você é um extrator de dados. Extraia apenas o dado puro do texto do usuário. Remova pontuações, palavras extras e responda APENAS com o valor bruto."},
-                    {"role": "user", "content": f"Extraia o dado puro deste texto baseado no contexto de cadastro: '{texto_usuario}'"}
-                ]
+                model="meta-llama/llama-3-8b-instruct:free",
+                messages=historicos[chat_id],
+                temperature=0.3
             )
         )
-        dado_limpo = resposta.choices[0].message.content.strip().replace("*", "")
+        texto_resposta = resposta.choices[0].message.content.replace("*", "")
     except Exception as e:
-        dado_limpo = texto_usuario  # se a IA falhar, usa o texto puro do usuário
+        print(f"Erro na IA: {e}")
+        await update.message.reply_text("⚠️ Ocorreu uma instabilidade temporária na IA. Por favor, tente enviar novamente.")
+        return
 
-    if estado_atual == "NOME":
-        dados_gatos[chat_id]["nome"] = dado_limpo
-        estados[chat_id] = "PESO"
-        await update.message.reply_text("Perfeito, anotado. Agora, qual é o peso atual do gato (em kg)?")
-        
-    elif estado_atual == "PESO":
-        dados_gatos[chat_id]["peso"] = dado_limpo
-        estados[chat_id] = "PORTE"
-        await update.message.reply_text("Qual é o porte ou altura do gato? (Exemplo: pequeno, médio, grande ou em centímetros)")
-        
-    elif estado_atual == "PORTE":
-        # Pegar apenas os números do peso para calcular a ração de forma segura via Python
+    # Processamento do salvamento via IA ou via sistema de redundância
+    if "DATA_UPDATE:" in texto_resposta:
+        partes = texto_resposta.split("DATA_UPDATE:")
+        texto_exibir = partes[0].strip()
         try:
-            peso_numerico = float(re.findall(r"[-+]?\d*\.\d+|\d+", dados_gatos[chat_id]["peso"])[0])
-            racao_calculada = int(peso_numerico * 15)  # 15g por quilo
-        except:
-            racao_calculada = 60  # Valor padrão caso digitem texto irreconhecível no peso
+            dados = partes[1].strip().split(",")
+            salvar_no_excel(dados[0].strip(), dados[1].strip(), dados[2].strip())
+            texto_exibir += "\n\n<b>✅ [Sistema]: Gato registrado com sucesso na planilha Excel pelo Agente de IA!</b>"
+            historicos[chat_id] = [{"role": "system", "content": INSTRUCOES_AGENTE}] # Reseta para o próximo gatinho
+        except Exception as e:
+            print(f"Erro ao processar dados da IA: {e}")
+    else:
+        texto_exibir = texto_resposta
+        # Redundância de segurança caso o Llama mude o formato final de resposta
+        if "registrado" in texto_resposta.lower() or "sucesso" in texto_resposta.lower():
+            if tentar_salvar_backup_preventivo(historicos[chat_id]):
+                texto_exibir += "\n\n<b>✅ [Sistema]: Dados salvos via redundância na planilha!</b>"
+                historicos[chat_id] = [{"role": "system", "content": INSTRUCOES_AGENTE}]
 
-        nome_final = dados_gatos[chat_id]["nome"]
-        peso_final = dados_gatos[chat_id]["peso"]
-        
-        # Salva fisicamente no Excel usando Python puro
-        salvar_no_excel(nome_final, peso_final, racao_calculada)
-        
-        # Resposta de finalização limpa
-        resposta_final = f"O felino {nome_final} foi registrado com sucesso.\n\n<b>✅ [Sistema]: Gato registrado com sucesso na planilha Excel do abrigo!</b>"
-        await update.message.reply_text(resposta_final, parse_mode="HTML")
-        
-        # Reseta o estado para o próximo cadastro
-        del estados[chat_id]
-        del dados_gatos[chat_id]
+    historicos[chat_id].append({"role": "assistant", "content": texto_exibir})
+    await update.message.reply_text(texto_exibir, parse_mode="HTML")
 
 async def envio_diario_meio_dia(context: ContextTypes.DEFAULT_TYPE):
     for chat_id in list(usuarios_ativos):
@@ -169,10 +204,10 @@ def main():
             application.add_handler(CommandHandler("remover", remover_gato))
             application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, responder_mensagem))
             
-            print("🚀 Bot ativo com máquina de estados!")
+            print("🚀 Agente de IA ativo e rodando!")
             application.run_polling(drop_pending_updates=True)
         except Exception as erro_rede:
-            print(f"Erro: {erro_rede}. Reiniciando em 10 segundos...")
+            print(f"Erro de rede: {erro_rede}. Reiniciando em 10 segundos...")
             time.sleep(10)
 
 if __name__ == "__main__":
