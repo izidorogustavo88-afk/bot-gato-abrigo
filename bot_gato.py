@@ -9,9 +9,13 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
 
+# PROTEÇÃO: Chaves lidas direto das variáveis de ambiente da Railway
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-NOME_PLANILHA = "gatos_abrigo.xlsx"
+
+# Correção crucial de caminho para a Railway salvar e ler o Excel no mesmo lugar
+PASTA_ATUAL = os.path.dirname(os.path.abspath(__file__))
+NOME_PLANILHA = os.path.join(PASTA_ATUAL, "gatos_abrigo.xlsx")
 
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
