@@ -167,7 +167,7 @@ async def responder_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE)
         try:
             dados = partes[1].strip().split(",")
             salvar_no_excel(dados[0].strip(), dados[1].strip(), dados[2].strip())
-            texto_exibir += "\n\n<b>✅ [Sistema]: Gato registrado com sucesso na planilha Excel pelo Agente de IA!</b>"
+            texto_exibir += "\n\n<b>✅ [Sistema]: Gato registrado com sucesso na planilha Excel pelo Agente de IA!(de /baixar para ver o download da planilha)</b>"
             
             # Limpa totalmente a memória assim que o cadastro é concluído com sucesso
             historicos[chat_id] = [{"role": "system", "content": INSTRUCOES_AGENTE}]
